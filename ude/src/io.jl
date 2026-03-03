@@ -40,10 +40,10 @@ end
 
 export append_csv_row
 
-function append_csv_row(path::AbstractString, row; delim=',')
+function append_csv_row(path::AbstractString, A; delim=',')
     ensure_dir(dirname(path))
     open(path, "a") do io
-        DelimitedFiles.writedlm(io, row, delim)
+        writedlm(io, A, delim)
     end
     return path
 end

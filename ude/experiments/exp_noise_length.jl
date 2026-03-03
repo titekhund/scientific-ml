@@ -1,9 +1,9 @@
 # experiments/exp_noise_length.jl
 #
 # Experiment: How noise level and data length (N points) affect performance.
-# For now, this script generates datasets and records baseline metrics:
-#   - error between noisy observations Xn and clean trajectory X (RMSE/NRMSE/R²).
-# Later you can plug in SINDy / UDE-SINDy to compute model-fit metrics too.
+# Generates datasets and records:
+#   (1) baseline observation error: Xn vs X (RMSE/NRMSE/R²)
+#   (2) SR3-SINDy rollout error: X̂ vs X (RMSE/NRMSE/R²)
 
 include(joinpath(@__DIR__, "..", "src", "ScientificML.jl"))
 using .ScientificML
@@ -13,12 +13,11 @@ using .ScientificML
 # -------------------------
 expname = "exp_noise_length"
 
-# Noise levels (relative-to-mean Gaussian noise, like your earlier script)
+# Noise levels (relative-to-mean Gaussian noise)
 noise_levels = [0.0, 1e-4, 1e-3, 1e-2, 5e-2]
 
-# Different dataset lengths (number of time points kept after simulation)
-# Note: with your current defaults (tspan=(0,10), saveat=0.25) you only have 41 points total.
-# So N will be clipped to available points automatically.
+# Dataset lengths (number of time points kept after simulation)
+# With tspan=(0,10) and saveat=0.25 you have only 41 points max; larger N will be clipped.
 N_values = [20, 41, 80, 200]
 
 # Replicates
@@ -27,7 +26,14 @@ seeds = 1:5
 # Simulation settings
 saveat = 0.25
 
-# Choose system: Goodwin (current systems.jl)
+# SINDy (SR3) settings
+polyorder = 3
+nu = 1.0
+λs = exp10.(-6:0.5:0)         # stronger thresholds than (-8:-2) -> more sparsity
+prox = ScientificML.DataDrivenSparse.SoftThreshold()
+prox_name = prox isa ScientificML.DataDrivenSparse.HardThreshold ? "hard" : "soft"
+
+# Choose system: Goodwin
 prob = make_goodwin_problem()
 
 # -------------------------
@@ -36,11 +42,17 @@ prob = make_goodwin_problem()
 outdir = make_run_dir(expname)  # results/exp_noise_length/<timestamp>/
 println("Saving to: ", outdir)
 
-# Summary rows will be appended here
 summary_path = joinpath(outdir, "summary.csv")
 
-# Write CSV header
-header = ["seed", "noise", "N", "T", "dt", "rmse", "nrmse", "r2", "rmse_v", "rmse_u", "nrmse_v", "nrmse_u"]
+# Write CSV header ONCE
+header = [
+  "seed","noise","N","T","dt",
+  "rmse_obs","nrmse_obs","r2_obs",
+  "rmse_v_obs","rmse_u_obs","nrmse_v_obs","nrmse_u_obs",
+  "sindy_rmse","sindy_nrmse","sindy_r2",
+  "sindy_rmse_v","sindy_rmse_u","sindy_nrmse_v","sindy_nrmse_u",
+  "polyorder","nu","lambda_min","lambda_max","prox"
+]
 write_csv(summary_path, reshape(header, 1, :))
 
 # -------------------------
@@ -54,26 +66,48 @@ for seed in seeds
             # Generate dataset
             t, X, Xn = make_dataset(prob, rng; saveat=saveat, N=N, noise_magnitude=noise)
 
-            # Baseline metrics: how far noisy observations are from clean trajectory
-            m = trajectory_metrics(X, Xn)
+            # Baseline metrics: noisy observations vs clean trajectory
+            m_obs = trajectory_metrics(X, Xn)
+            rmse_v_obs, rmse_u_obs = m_obs.per_state_rmse
+            nrmse_v_obs, nrmse_u_obs = m_obs.per_state_nrmse
 
-            # Per-state metrics (2 states): [v, u] for Goodwin
-            rmse_v, rmse_u = m.per_state_rmse
-            nrmse_v, nrmse_u = m.per_state_nrmse
+            # SINDy rollout metrics (defaults to NaN if anything fails)
+            sindy_rmse = NaN; sindy_nrmse = NaN; sindy_r2 = NaN
+            sindy_rmse_v = NaN; sindy_rmse_u = NaN
+            sindy_nrmse_v = NaN; sindy_nrmse_u = NaN
 
-            T = t[end] - t[1]
+            try
+                res, system, _ = fit_sindy_sr3(t, Xn; polyorder=polyorder, λs=λs, nu=nu, proximal=prox, rng=rng)
+                Xhat = predict_sindy(res, Xn[:, 1], t)
+
+                m_sindy = trajectory_metrics(X, Xhat)
+                sindy_rmse  = m_sindy.rmse
+                sindy_nrmse = m_sindy.nrmse
+                sindy_r2    = m_sindy.r2
+
+                sindy_rmse_v, sindy_rmse_u = m_sindy.per_state_rmse
+                sindy_nrmse_v, sindy_nrmse_u = m_sindy.per_state_nrmse
+            catch e
+                println("SINDy failed for seed=$(seed) noise=$(noise) N=$(length(t)) : ", e)
+            end
+
+            # Time grid info
+            T  = t[end] - t[1]
             dt = length(t) > 1 ? (t[2] - t[1]) : NaN
 
-            row = [seed, noise, length(t), T, dt, m.rmse, m.nrmse, m.r2, rmse_v, rmse_u, nrmse_v, nrmse_u]
-            write_csv(summary_path, row')  # append as 1-row matrix by writing a row
+            row = [
+              seed, noise, length(t), T, dt,
+              m_obs.rmse, m_obs.nrmse, m_obs.r2,
+              rmse_v_obs, rmse_u_obs, nrmse_v_obs, nrmse_u_obs,
+              sindy_rmse, sindy_nrmse, sindy_r2,
+              sindy_rmse_v, sindy_rmse_u, sindy_nrmse_v, sindy_nrmse_u,
+              polyorder, nu, minimum(λs), maximum(λs), prox_name
+            ]
 
-            # Optional: save the actual dataset for this run (comment out if you want fewer files)
-            run_tag = "seed$(seed)_noise$(noise)_N$(length(t))"
-            write_csv(joinpath(outdir, "t_" * run_tag * ".csv"), t)
-            write_csv(joinpath(outdir, "X_clean_" * run_tag * ".csv"), X')
-            write_csv(joinpath(outdir, "X_noisy_" * run_tag * ".csv"), Xn')
+            # APPEND (do not overwrite)
+            append_csv_row(summary_path, reshape(row, 1, :))
 
-            println("Done: seed=$(seed) noise=$(noise) N=$(length(t)) rmse=$(round(m.rmse, digits=6))")
+            println("Done: seed=$(seed) noise=$(noise) N=$(length(t)) obs_rmse=$(round(m_obs.rmse, digits=6)) sindy_rmse=$(round(sindy_rmse, digits=6))")
         end
     end
 end
