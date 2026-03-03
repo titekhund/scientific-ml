@@ -37,3 +37,13 @@ function write_vec_csv(path::AbstractString, v; delim=',')
     writedlm(path, v, delim)
     return path
 end
+
+export append_csv_row
+
+function append_csv_row(path::AbstractString, row; delim=',')
+    ensure_dir(dirname(path))
+    open(path, "a") do io
+        DelimitedFiles.writedlm(io, row, delim)
+    end
+    return path
+end
