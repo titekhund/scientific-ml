@@ -31,7 +31,7 @@ include("systems.jl")
 include("simulate.jl")
 include("io.jl")
 
-#include(joinpath("methods", "sindy.jl"))
+include(joinpath("methods", "sindy.jl"))
 #include(joinpath("methods", "ude.jl"))
 #include(joinpath("methods", "ude_sindy.jl")) 
 
