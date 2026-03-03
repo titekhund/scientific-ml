@@ -30,11 +30,11 @@ using Plots
 include("systems.jl")
 include("simulate.jl")
 
-include(joinpath("methods", "sindy.jl"))
-include(joinpath("methods", "ude.jl"))
-include(joinpath("methods", "ude_sindy.jl")) 
+#include(joinpath("methods", "sindy.jl"))
+#include(joinpath("methods", "ude.jl"))
+#include(joinpath("methods", "ude_sindy.jl")) 
 
-include("io.jl")      # for CSV saving
-include("metrics.jl") # for comparing methods
+#include("io.jl")      # for CSV saving
+#include("metrics.jl") # for comparing methods
 
 end # module
