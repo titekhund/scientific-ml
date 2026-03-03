@@ -2,7 +2,7 @@
 # Pure SINDy (SR3) pipeline
 # Included inside `module ScientificML` — no nested module needed.
 
-export sindy_poly_basis, fit_sindy_sr3
+export sindy_poly_basis, fit_sindy_sr3, predict_sindy 
 
 using DataDrivenDiffEq
 using DataDrivenSparse
@@ -62,4 +62,37 @@ function fit_sindy_sr3(ts, X;
     params    = isempty(param_map) ? nothing : param_map
 
     return res, system, params
+end
+
+
+"""
+Roll out (simulate) a discovered SINDy model and return Xhat (n_states × n_time).
+
+Inputs:
+- res: result returned by fit_sindy_sr3 (recommended), OR a ModelingToolkit ODESystem
+- x0: initial condition vector (length = n_states)
+- ts: time grid vector
+
+Returns:
+- Xhat: Array with shape (n_states, length(ts))
+"""
+function predict_sindy(res, x0, ts;
+        solver = Vern7(),
+        abstol = 1e-9,
+        reltol = 1e-9
+    )
+
+    # Allow passing either the solve result or the system itself
+    system = hasmethod(get_basis, Tuple{typeof(res)}) ? get_basis(res) : res
+
+    # Map (p₁=>..., p₂=>..., ...) from the fitted system
+    pmap = Dict(get_parameter_map(system))
+
+    # Convert to numeric vector in the correct parameter order
+    pvec = ModelingToolkit.varmap_to_vars(pmap, ModelingToolkit.parameters(system))
+
+    tspan = (ts[1], ts[end])
+    prob = ODEProblem(system, x0, tspan, pvec)
+    sol   = solve(prob, solver; abstol=abstol, reltol=reltol, saveat=ts)
+    return Array(sol)
 end
