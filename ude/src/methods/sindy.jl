@@ -2,7 +2,7 @@
 # Pure SINDy (SR3) pipeline
 # Included inside `module ScientificML` — no nested module needed.
 
-export sindy_poly_basis, fit_sindy_sr3, predict_sindy 
+export sindy_poly_basis, fit_sindy_sr3, predict_sindy, eval_sindy_at_states
 
 using DataDrivenDiffEq
 using DataDrivenSparse
@@ -95,4 +95,42 @@ function predict_sindy(res, x0, ts;
     prob = ODEProblem(system, x0, tspan, pvec)
     sol   = solve(prob, solver; abstol=abstol, reltol=reltol, saveat=ts)
     return Array(sol)
+end
+
+"""
+Evaluate the discovered SINDy RHS at each column of X.
+Returns dX shaped (n_states, size(X,2)).
+
+Extracts symbolic equations and fitted parameters from the Basis,
+substitutes parameter values, then compiles pure-Julia callables via
+`Symbolics.build_function`.  No ODE solve or finite differences —
+the model is evaluated pointwise at the supplied states, matching
+how `evaluate_true_derivatives` works for the ground truth.
+"""
+function eval_sindy_at_states(res, t, X)
+    system = hasmethod(get_basis, Tuple{typeof(res)}) ? get_basis(res) : res
+
+    Sym = ModelingToolkit.Symbolics
+
+    eqs   = ModelingToolkit.equations(system)
+    pmap  = get_parameter_map(system)
+    svars = DataDrivenDiffEq.states(system)   # [x[1], x[2]]
+
+    # Substitute fitted parameter values → expressions in state vars only
+    param_dict = Dict(pmap)
+    rhs_num    = [Sym.substitute(eq.rhs, param_dict) for eq in eqs]
+
+    # Compile to fast Julia lambdas: f(x1, x2) -> Float64
+    fs = [Sym.build_function(expr, svars...; expression = Val{false})
+          for expr in rhs_num]
+
+    n, T = size(X)
+    length(fs) == n || error("SINDy discovered $(length(fs)) equations but state has $n dimensions")
+    dX = zeros(n, T)
+    for j in 1:T
+        for k in 1:n
+            dX[k, j] = fs[k](X[1, j], X[2, j])
+        end
+    end
+    return dX
 end
