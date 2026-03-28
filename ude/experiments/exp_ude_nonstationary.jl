@@ -14,6 +14,8 @@ using Optimization, OptimizationOptimisers, OptimizationOptimJL, LineSearches
 using ComponentArrays, Lux, Zygote
 using StableRNGs, LinearAlgebra, Statistics, JLD2
 
+include(joinpath(@__DIR__, "pysindy_sr3.jl"))
+
 # ─── Data ─────────────────────────────────────────────────────────────────────
 
 x0_true, regime_configs, breakpoints = nonstationary_goodwin_configs()
@@ -139,10 +141,9 @@ end
 
 jld2_path(noise_label) = joinpath("results", "ude_nonstationary_noise_$(noise_label).jld2")
 
-# ─── Core function ─────────────────────────────────────────────────────────────
+# ─── UDE training function (separated from SINDy stage) ───────────────────────
 
-function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
-                       noise_label; rng_seed = 1111)
+function train_ude(X_data, X_clean, t_full; rng_seed = 1111)
     N = size(X_clean, 2)
 
     # Fresh NN params
@@ -191,6 +192,13 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
     end
 
     println("Final training loss: $(round(ms_loss(p_trained, extra), sigdigits = 5))")
+    return p_trained, losses
+end
+
+# ─── UDE rollout and NN extraction ───────────────────────────────────────────
+
+function extract_ude_outputs(p_trained, X_clean, t_full)
+    N = size(X_clean, 2)
 
     # ── Full-trajectory UDE rollout ───────────────────────────────────────────
 
@@ -244,9 +252,46 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
     println("  NN1: mean=$(round(mean(nn_at_ude[1, :]), sigdigits=4))  std=$(round(std(nn_at_ude[1, :]), sigdigits=4))")
     println("  NN2: mean=$(round(mean(nn_at_ude[2, :]), sigdigits=4))  std=$(round(std(nn_at_ude[2, :]), sigdigits=4))")
 
-    # ── Targeted exhaustive SINDy on NN outputs ──────────────────────────────
+    return Xhat_ude, nn_at_true, nn_at_ude
+end
 
-    println("\n── Targeted SINDy on NN outputs ──")
+# ─── Core function (SINDy analysis + save) ────────────────────────────────────
+
+function run_sindy_stage(p_trained, losses, Xhat_ude, nn_at_true, nn_at_ude,
+                         X_clean, t_full, breakpoints, regime_configs,
+                         noise_label)
+    N = size(X_clean, 2)
+
+    # ── Julia DataDrivenSparse: ADMM + STLSQ + SR3 ──────────────────────────
+
+    println("\n── Julia DataDrivenSparse: ADMM + STLSQ + SR3 ──")
+
+    sparse_reg_results = Dict{String, Any}()
+    for meth in [:ADMM, :STLSQ, :SR3]
+        label_m = string(meth)
+        println("\n  Method: $label_m")
+        try
+            res_sr, sys_sr, params_sr = fit_sindy_from_nn(
+                X_clean, nn_at_true;
+                polyorder = 2, method = meth,
+                batchsize = 30,
+                rng = ScientificML.StableRNGs.StableRNG(42))
+
+            eqs = ScientificML.ModelingToolkit.equations(sys_sr)
+            println("  Discovered equations ($label_m):")
+            for (i, eq) in enumerate(eqs)
+                println("    eq$i: ", eq)
+            end
+            sparse_reg_results[label_m] = (res = res_sr, system = sys_sr, params = params_sr)
+        catch e
+            println("  $label_m failed: ", e)
+            sparse_reg_results[label_m] = nothing
+        end
+    end
+
+    # ── Supplementary: Exhaustive OLS on NN outputs ────────────────────────
+
+    println("\n── Supplementary: Exhaustive OLS on NN outputs ──")
 
     sindy_results = []
     for (k, label) in enumerate(["NN1 (correction to dv/dt)", "NN2 (correction to du/dt)"])
@@ -258,6 +303,23 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
         println("\n  $label")
         println("  Winning model: $(join(["$(round(coeffs[i], sigdigits=4)) * $(names[i])" for i in eachindex(names)], " + "))")
         println("  MSE = $(round(mse, sigdigits=4))")
+    end
+
+    # ── PySINDy SR3 (L0) — primary discovery method ──────────────────────────
+
+    println("\n── PySINDy SR3 (L0) on NN outputs ──")
+
+    pysindy_result = nothing
+    dX_pysindy     = nothing
+    try
+        pysindy_result = run_pysindy_sr3(X_clean, nn_at_true)
+
+        # Reconstruct full derivatives from PySINDy predictions
+        dX_pysindy = zeros(2, N)
+        dX_pysindy[1, :] .= ETA1_FIXED .* X_clean[1, :] .+ pysindy_result["pred_f1"]
+        dX_pysindy[2, :] .= .-ETA2_FIXED .* X_clean[2, :] .+ pysindy_result["pred_f2"]
+    catch e
+        println("  PySINDy SR3 failed: ", e)
     end
 
     # ── Comparison vs true interaction terms ──────────────────────────────────
@@ -295,7 +357,7 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
     dX_sindy = vcat(dv_sindy', du_sindy')   # 2 × N
 
     regime_labels_deriv = ["R1 [0,200)", "R2 [200,290)", "Tr [290,300)", "R3 [300,500]"]
-    println("\n  Per-regime derivative RMSE (true vs UDE+SINDy reconstructed):")
+    println("\n  Per-regime derivative RMSE (true vs UDE+ExhaustiveOLS reconstructed):")
     for i in 1:4
         m = masks[i]
         !any(m) && continue
@@ -303,7 +365,77 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
         println("  $(regime_labels_deriv[i]):  RMSE = $(round(rmse_i, sigdigits=4))")
     end
 
+    # Per-regime derivative RMSE for sparse regression methods
+    for meth in ["ADMM", "STLSQ", "SR3"]
+        sr = get(sparse_reg_results, meth, nothing)
+        sr === nothing && continue
+        try
+            dX_sr = eval_sindy_at_states(sr.res, t_full, X_clean)
+            # Add fixed mechanistic terms back
+            dX_sr[1, :] .+= ETA1_FIXED .* X_clean[1, :]
+            dX_sr[2, :] .-= ETA2_FIXED .* X_clean[2, :]
+            println("\n  Per-regime derivative RMSE (true vs UDE+$meth):")
+            for i in 1:4
+                m = masks[i]
+                !any(m) && continue
+                rmse_i = sqrt(mean((dX_true[:, m] .- dX_sr[:, m]) .^ 2))
+                println("  $(regime_labels_deriv[i]):  RMSE = $(round(rmse_i, sigdigits=4))")
+            end
+        catch e
+            println("  $meth derivative evaluation failed: ", e)
+        end
+    end
+
+    # Per-regime derivative RMSE for PySINDy SR3
+    if dX_pysindy !== nothing
+        println("\n  Per-regime derivative RMSE (true vs UDE+PySINDy_SR3):")
+        for i in 1:4
+            m = masks[i]
+            !any(m) && continue
+            rmse_i = sqrt(mean((dX_true[:, m] .- dX_pysindy[:, m]) .^ 2))
+            println("  $(regime_labels_deriv[i]):  RMSE = $(round(rmse_i, sigdigits=4))")
+        end
+        global_rmse_pysindy = sqrt(mean((dX_true .- dX_pysindy) .^ 2))
+        println("  Global RMSE (PySINDy SR3): $(round(global_rmse_pysindy, sigdigits=4))")
+    end
+
     # ── Save ──────────────────────────────────────────────────────────────────
+
+    # ── Build sparse regression equation strings + derivative predictions ─────
+
+    sparse_eq_strings = Dict{String, Any}()
+    sparse_dX = Dict{String, Any}()
+    for meth in ["ADMM", "STLSQ", "SR3"]
+        sr = get(sparse_reg_results, meth, nothing)
+        if sr !== nothing
+            try
+                eqs = ScientificML.ModelingToolkit.equations(sr.system)
+                sparse_eq_strings[meth] = [string(eq.rhs) for eq in eqs]
+            catch
+                sparse_eq_strings[meth] = nothing
+            end
+            try
+                dX_sr = eval_sindy_at_states(sr.res, t_full, X_clean)
+                dX_sr[1, :] .+= ETA1_FIXED .* X_clean[1, :]
+                dX_sr[2, :] .-= ETA2_FIXED .* X_clean[2, :]
+                sparse_dX[meth] = dX_sr
+            catch
+                sparse_dX[meth] = nothing
+            end
+        else
+            sparse_eq_strings[meth] = nothing
+            sparse_dX[meth] = nothing
+        end
+    end
+
+    # ── Build PySINDy save data ───────────────────────────────────────────────
+
+    pysindy_coeffs_f1      = pysindy_result !== nothing ? pysindy_result["coeffs_f1"] : nothing
+    pysindy_coeffs_f2      = pysindy_result !== nothing ? pysindy_result["coeffs_f2"] : nothing
+    pysindy_active_f1      = pysindy_result !== nothing ? pysindy_result["active_f1"] : nothing
+    pysindy_active_f2      = pysindy_result !== nothing ? pysindy_result["active_f2"] : nothing
+    pysindy_feature_names  = pysindy_result !== nothing ? pysindy_result["feature_names"] : nothing
+    pysindy_selected_lambda = pysindy_result !== nothing ? pysindy_result["selected_lambda"] : nothing
 
     save_path = jld2_path(noise_label)
     ensure_dir(dirname(save_path))
@@ -311,6 +443,15 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
         p_trained, X_clean, Xhat_ude,
         nn_at_true, nn_at_ude, losses,
         sindy_results,
+        sparse_eq_strings,
+        sparse_dX,
+        pysindy_coeffs_f1,
+        pysindy_coeffs_f2,
+        pysindy_active_f1,
+        pysindy_active_f2,
+        pysindy_feature_names,
+        pysindy_selected_lambda,
+        dX_pysindy,
         t          = t_full,
         breakpoints,
         dX_true,
@@ -326,7 +467,8 @@ function run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs,
         println("  (also copied → $latest)")
     end
 
-    return (; p_trained, losses, sindy_results, dX_sindy, dX_true, masks)
+    return (; p_trained, losses, sindy_results, sparse_reg_results,
+              dX_sindy, dX_true, dX_pysindy, masks)
 end
 
 # ─── Copy existing noise=0 result ─────────────────────────────────────────────
@@ -349,8 +491,32 @@ for noise in noise_levels
     path  = jld2_path(label)
 
     if isfile(path)
-        println("\n═══ noise=$label — SKIPPED ($(path) exists) ═══")
-        continue
+        existing = load(path)
+        has_sparse  = haskey(existing, "sparse_dX")
+        has_pysindy = haskey(existing, "dX_pysindy") && existing["dX_pysindy"] !== nothing
+
+        if has_sparse && has_pysindy
+            println("\n═══ noise=$label — SKIPPED ($(path) exists with sparse + PySINDy results) ═══")
+            continue
+        end
+
+        # Has trained UDE but missing PySINDy (or sparse) — re-run SINDy only
+        if haskey(existing, "p_trained")
+            println("\n═══ noise=$label — RE-RUNNING SINDy stage only (loading trained UDE from JLD2) ═══")
+
+            p_trained = existing["p_trained"]
+            losses    = existing["losses"]
+
+            # Re-extract NN outputs from saved trained params
+            Xhat_ude, nn_at_true, nn_at_ude = extract_ude_outputs(
+                p_trained, X_clean, t_full)
+
+            run_sindy_stage(p_trained, losses, Xhat_ude, nn_at_true, nn_at_ude,
+                            X_clean, t_full, breakpoints, regime_configs, label)
+            continue
+        end
+
+        println("\n═══ noise=$label — FULL RE-RUN ($(path) missing trained UDE) ═══")
     end
 
     println("\n═══════════════════════════════════════════════════════════")
@@ -363,7 +529,11 @@ for noise in noise_levels
         add_relative_noise(X_clean, StableRNG(1); noise_magnitude = noise)
     end
 
-    run_ude_sindy(X_data, X_clean, t_full, breakpoints, regime_configs, label)
+    p_trained, losses = train_ude(X_data, X_clean, t_full)
+    Xhat_ude, nn_at_true, nn_at_ude = extract_ude_outputs(p_trained, X_clean, t_full)
+
+    run_sindy_stage(p_trained, losses, Xhat_ude, nn_at_true, nn_at_ude,
+                    X_clean, t_full, breakpoints, regime_configs, label)
 end
 
 # ─── Combined summary ─────────────────────────────────────────────────────────
@@ -404,6 +574,35 @@ for noise in noise_levels
     println("    true v*u     = eq1: -0.10/-0.12 (R1/R3),  eq2: +0.10")
     println("    deriv RMSE   = $(round(global_rmse, sigdigits=4))")
     println("    iters        = $(length(ls))")
+
+    sp_eqs = get(data, "sparse_eq_strings", nothing)
+    if sp_eqs !== nothing
+        for meth in ["ADMM", "STLSQ", "SR3"]
+            eqs = get(sp_eqs, meth, nothing)
+            eqs === nothing && continue
+            println("    $meth: eq1=$(eqs[1])  eq2=$(eqs[2])")
+        end
+    end
+
+    # PySINDy SR3 results
+    dX_py = get(data, "dX_pysindy", nothing)
+    if dX_py !== nothing
+        rmse_py = sqrt(mean((dX_t .- dX_py) .^ 2))
+        println("    PySINDy SR3 deriv RMSE = $(round(rmse_py, sigdigits=4))")
+    end
+
+    py_active_f1 = get(data, "pysindy_active_f1", nothing)
+    py_active_f2 = get(data, "pysindy_active_f2", nothing)
+    if py_active_f1 !== nothing
+        f1_str = join(["$(round(c, sigdigits=5))*$n" for (n, c) in py_active_f1], " + ")
+        f2_str = join(["$(round(c, sigdigits=5))*$n" for (n, c) in py_active_f2], " + ")
+        println("    PySINDy SR3: f1=$f1_str  f2=$f2_str")
+    end
+
+    py_lambda = get(data, "pysindy_selected_lambda", nothing)
+    if py_lambda !== nothing
+        println("    PySINDy selected λ = $py_lambda")
+    end
 end
 
 println("\nDone.")

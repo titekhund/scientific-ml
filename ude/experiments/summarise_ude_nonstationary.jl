@@ -58,6 +58,14 @@ end
 "Count additive terms in a symbolic equation string."
 count_terms_str(s::String) = 1 + count(" + ", s)
 
+# ─── UDE+Sparse equation string from sparse_eq_strings Dict ─────────────────
+
+function sparse_eq_str(sparse_dict, method, idx)
+    eqs = get(sparse_dict, method, nothing)
+    eqs === nothing && return "not_available"
+    return replace(eqs[idx], ',' => ';')
+end
+
 # ─── UDE+SINDy equation string from sindy_results NamedTuple ────────────────
 
 const ETA1_FIXED = 0.05
@@ -182,10 +190,10 @@ end
 println("\nSINDy summary → ", sindy_summary_path)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — UDE+SINDy derivative residuals (from JLD2)
+# STAGE 2 — UDE+ExhaustiveOLS derivative residuals (from JLD2)
 # ═════════════════════════════════════════════════════════════════════════════
 
-println("\n══ Stage 2: UDE+SINDy derivative residuals ══")
+println("\n══ Stage 2: UDE+ExhaustiveOLS derivative residuals ══")
 
 jld2_dir = joinpath(@__DIR__, "..", "results")
 noise_files = filter(readdir(jld2_dir; join = true)) do f
@@ -231,10 +239,90 @@ for path in noise_files
             "deriv_R²=$(round(g_r2, sigdigits=4))")
 end
 
-println("\nUDE+SINDy summary → ", ude_summary_path)
+println("\nUDE+ExhaustiveOLS summary → ", ude_summary_path)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# COMBINED — stack both with a method column
+# STAGE 2b — UDE+SparseReg derivative residuals (ADMM/STLSQ from JLD2)
+# ═════════════════════════════════════════════════════════════════════════════
+
+println("\n══ Stage 2b: UDE+SparseReg derivative residuals (ADMM/STLSQ) ══")
+
+sparse_summary_path = joinpath(outdir, "summary_ude_sparse.csv")
+write_csv(sparse_summary_path, reshape(HEADER, 1, :))
+
+# Re-generate data for derivative evaluation via eval_sindy_at_states
+x0_s2, rc_s2, bp_s2 = nonstationary_goodwin_configs()
+t_s2, X_s2 = simulate_nonstationary(x0_s2, rc_s2; saveat = saveat)
+masks_s2   = get_regime_masks(t_s2, bp_s2)
+dX_true_s2 = evaluate_true_derivatives(t_s2, X_s2, rc_s2, bp_s2)
+
+sparse_rows_written = 0
+
+for path in noise_files
+    data  = load(path)
+    label = if haskey(data, "noise_label")
+        data["noise_label"]
+    else
+        m = match(r"noise_([\d.e+-]+)\.jld2$", basename(path))
+        m === nothing ? continue : m[1]
+    end
+    noise = parse(Float64, label)
+
+    sp_dX  = get(data, "sparse_dX", nothing)
+    sp_eqs = get(data, "sparse_eq_strings", nothing)
+    sp_dX === nothing && sp_eqs === nothing && continue
+
+    dX_true_local = data["dX_true"]
+    masks_local   = data["masks"]
+
+    for meth in ["ADMM", "STLSQ", "SR3"]
+        # Get derivative predictions
+        dX_pred = nothing
+        if sp_dX !== nothing
+            dX_pred = get(sp_dX, meth, nothing)
+        end
+
+        # Get equation strings
+        eq_v_str = "not_available"
+        eq_u_str = "not_available"
+        n_terms_sp = NaN
+        if sp_eqs !== nothing
+            eq_strs = get(sp_eqs, meth, nothing)
+            if eq_strs !== nothing
+                eq_v_str = "$(meth): $(replace(eq_strs[1], ',' => ';'))"
+                eq_u_str = "$(meth): $(replace(eq_strs[2], ',' => ';'))"
+                n_terms_sp = count_terms_str(eq_strs[1]) + count_terms_str(eq_strs[2])
+            end
+        end
+
+        # Compute metrics if predictions available
+        if dX_pred !== nothing
+            g_rmse    = deriv_rmse(dX_true_local, dX_pred)
+            g_nrmse   = deriv_nrmse(dX_true_local, dX_pred)
+            g_r2      = deriv_r2(dX_true_local, dX_pred)
+            r_metrics = regime_deriv_metrics(dX_true_local, dX_pred, masks_local)
+
+            println("  noise=$label  $meth: deriv_RMSE=$(round(g_rmse, sigdigits=4))  " *
+                    "deriv_R²=$(round(g_r2, sigdigits=4))")
+        else
+            g_rmse = NaN; g_nrmse = NaN; g_r2 = NaN
+            r_metrics = [(RMSE=NaN, NRMSE=NaN, R2=NaN) for _ in 1:4]
+
+            println("  noise=$label  $meth: no derivative predictions available")
+        end
+
+        row = metrics_row(1, noise, size(dX_true_local, 2),
+                          g_rmse, g_nrmse, g_r2, r_metrics,
+                          NaN, n_terms_sp, eq_v_str, eq_u_str)
+        append_csv_row(sparse_summary_path, reshape(row, 1, :))
+        sparse_rows_written += 1
+    end
+end
+
+println("\nUDE+SparseReg summary → ", sparse_summary_path, " ($sparse_rows_written rows)")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# COMBINED — stack all methods with a method column
 # ═════════════════════════════════════════════════════════════════════════════
 
 println("\n══ Building combined CSV ══")
@@ -252,7 +340,19 @@ n_sindy = size(sindy_data, 1)
 n_ude   = size(ude_data, 1)
 ncols   = length(sindy_hdr)
 
-combined = Matrix{Any}(undef, n_sindy + n_ude, ncols + 1)
+# Load sparse summary if it has rows
+sparse_data_rows = nothing
+if sparse_rows_written > 0
+    sparse_data_raw, sparse_hdr = readdlm(sparse_summary_path, ',', header = true)
+    sparse_hdr = vec(sparse_hdr)
+    @assert sparse_hdr == sindy_hdr "Sparse summary headers differ"
+    sparse_data_rows = sparse_data_raw
+end
+
+n_sparse = sparse_data_rows === nothing ? 0 : size(sparse_data_rows, 1)
+n_total  = n_sindy + n_ude + n_sparse
+
+combined = Matrix{Any}(undef, n_total, ncols + 1)
 for r in 1:n_sindy
     combined[r, 1] = "sindy"
     for c in 1:ncols
@@ -260,14 +360,20 @@ for r in 1:n_sindy
     end
 end
 for r in 1:n_ude
-    combined[n_sindy + r, 1] = "ude_sindy"
+    combined[n_sindy + r, 1] = "ude_exhaustive_ols"
     for c in 1:ncols
         combined[n_sindy + r, c + 1] = ude_data[r, c]
+    end
+end
+for r in 1:n_sparse
+    combined[n_sindy + n_ude + r, 1] = "ude_sparse_reg"
+    for c in 1:ncols
+        combined[n_sindy + n_ude + r, c + 1] = sparse_data_rows[r, c]
     end
 end
 
 write_csv(combined_path, vcat(reshape(combined_header, 1, :), combined))
 
 println("Combined CSV → ", combined_path)
-println("  $n_sindy sindy + $n_ude ude_sindy = $(n_sindy + n_ude) total rows")
+println("  $n_sindy sindy + $n_ude ude_exhaustive_ols + $n_sparse ude_sparse_reg = $n_total total rows")
 println("\nDone.")

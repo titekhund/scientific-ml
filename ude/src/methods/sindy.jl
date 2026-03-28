@@ -2,9 +2,10 @@
 # Pure SINDy (SR3) pipeline
 # Included inside `module ScientificML` — no nested module needed.
 
-export sindy_poly_basis, fit_sindy_sr3, predict_sindy, eval_sindy_at_states
+export sindy_poly_basis, fit_sindy_sr3, fit_sindy_from_nn, predict_sindy, eval_sindy_at_states
 
 using DataDrivenDiffEq
+using DataDrivenDiffEq: DirectDataDrivenProblem, DataProcessing, DataNormalization, ZScoreTransform, bic
 using DataDrivenSparse
 using ModelingToolkit
 using StableRNGs
@@ -64,6 +65,73 @@ function fit_sindy_sr3(ts, X;
     return res, system, params
 end
 
+
+"""
+Run sparse regression on NN outputs using DirectDataDrivenProblem.
+
+Inputs:
+- X: states matrix (n_states × n_time)
+- Y: NN output matrix (n_states × n_time) — the learned missing terms
+
+Keyword arguments:
+- polyorder: max polynomial degree for basis (default 2)
+- method: :ADMM or :STLSQ (default :ADMM)
+- λ_admm: ADMM sparsity parameter (default 1e-1)
+- λs_stlsq: STLSQ threshold grid (default exp10.(-4:0.5:0))
+- digits: rounding precision (default 4)
+- batchsize: DataProcessing batch size (default 30; reduce for small datasets)
+- rng: random number generator
+
+Returns: (res, system, params) same as fit_sindy_sr3
+"""
+function fit_sindy_from_nn(X, Y;
+        polyorder::Int = 2,
+        λ_admm::Real   = 1e-1,
+        λs_stlsq       = exp10.(-4:0.5:0),
+        λs_sr3          = exp10.(-6:0.5:0),
+        nu_sr3::Real    = 1.0,
+        proximal_sr3    = SoftThreshold(),
+        method::Symbol  = :ADMM,
+        digits::Int     = 4,
+        batchsize::Int  = 30,
+        rng             = StableRNGs.StableRNG(1))
+
+    n = size(X, 1)
+    basis = sindy_poly_basis(n; polyorder = polyorder)
+    prob  = DirectDataDrivenProblem(X, Y)
+
+    opt = if method == :ADMM
+        DataDrivenSparse.ADMM(λ_admm)
+    elseif method == :STLSQ
+        DataDrivenSparse.STLSQ(λs_stlsq)
+    elseif method == :SR3
+        DataDrivenSparse.SR3(λs_sr3, nu_sr3, proximal_sr3)
+    else
+        error("method must be :ADMM, :STLSQ, or :SR3, got :$method")
+    end
+
+    sampler = DataProcessing(
+        split     = 0.9,
+        batchsize = batchsize,
+        shuffle   = true,
+        rng       = rng,
+    )
+    options = DataDrivenCommonOptions(
+        maxiters        = 10_000,
+        normalize       = DataNormalization(ZScoreTransform),
+        selector        = bic,
+        digits          = digits,
+        data_processing = sampler,
+    )
+
+    res    = solve(prob, basis, opt; options = options)
+    system = get_basis(res)
+
+    param_map = get_parameter_map(system)
+    params    = isempty(param_map) ? nothing : param_map
+
+    return res, system, params
+end
 
 """
 Roll out (simulate) a discovered SINDy model and return Xhat (n_states × n_time).
